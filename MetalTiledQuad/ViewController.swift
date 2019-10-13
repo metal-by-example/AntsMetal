@@ -71,7 +71,10 @@ class ViewController: NSViewController, MTKViewDelegate {
         vertexDescriptor.attributes[0].format = .float2 // screen-space position
         vertexDescriptor.attributes[0].offset = 0
         vertexDescriptor.attributes[0].bufferIndex = 0
-        vertexDescriptor.layouts[0].stride = MemoryLayout<Float>.size * 2
+        vertexDescriptor.attributes[1].format = .float2 // texture coordinates
+        vertexDescriptor.attributes[1].offset = MemoryLayout<Float>.size * 2
+        vertexDescriptor.attributes[1].bufferIndex = 0
+        vertexDescriptor.layouts[0].stride = MemoryLayout<Float>.size * 4
         
         let renderPipelineDescriptor = MTLRenderPipelineDescriptor()
         renderPipelineDescriptor.vertexFunction = vertexFunction
@@ -85,10 +88,14 @@ class ViewController: NSViewController, MTKViewDelegate {
         } catch {
             print("Filed to create render pipeline state because \(error)")
         }
+        
+        if let kernelFunction = library.makeFunction(name: "antsKernel") {
+            computePipelineState = try? device.makeComputePipelineState(function: kernelFunction)
+        }
 
         createTextures()
 
-        (view as? MTKView)?.preferredFramesPerSecond = 1
+        (view as? MTKView)?.preferredFramesPerSecond = 30
     }
 
     // MARK: - Generate Textures
@@ -97,26 +104,25 @@ class ViewController: NSViewController, MTKViewDelegate {
         textures.removeAll()
 
         let textureDescriptor = MTLTextureDescriptor()
-        // Got an error saying textures had to be divisible by 256
-        textureDescriptor.width = Int(ceil(view.frame.width / 256)) * 256
-        textureDescriptor.height = Int(ceil(view.frame.height / 256)) * 256
+        textureDescriptor.width = Int(view.frame.width)
+        textureDescriptor.height = Int(view.frame.height)
         textureDescriptor.pixelFormat = .bgra8Unorm
-        // Got an error about resource options had to match the buffer resource options. Don't know if this is correct.
         textureDescriptor.resourceOptions = .storageModePrivate
-        textureDescriptor.usage = [.shaderWrite, .shaderRead]
+        textureDescriptor.usage = [.shaderWrite, .shaderRead, .renderTarget]
 
-        let floatSize = MemoryLayout<Float>.stride
-        let count = textureDescriptor.width * 2 * textureDescriptor.height * 2
-        let textureBuffer = device.makeBuffer(length: count * floatSize, options: .storageModePrivate)!
-
-        textures.append(textureBuffer.makeTexture(
-            descriptor: textureDescriptor,
-            offset: 0,
-            bytesPerRow: textureDescriptor.width * 4 * floatSize)!)
-        textures.append(textureBuffer.makeTexture(
-            descriptor: textureDescriptor,
-            offset: 0,
-            bytesPerRow: textureDescriptor.width * 4)!)
+        textures.append(device.makeTexture(descriptor: textureDescriptor)!)
+        textures.append(device.makeTexture(descriptor: textureDescriptor)!)
+        
+        // Run an empty render pass to clear the contents of the texture we'll be blitting from first
+        let commandBuffer = commandQueue.makeCommandBuffer()!
+        let renderPassDescriptor = MTLRenderPassDescriptor()
+        renderPassDescriptor.colorAttachments[0].texture = textures[inactiveTextureIndex]
+        renderPassDescriptor.colorAttachments[0].loadAction = .clear
+        renderPassDescriptor.colorAttachments[0].storeAction = .store
+        renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
+        let renderCommandEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor)!
+        renderCommandEncoder.endEncoding()
+        commandBuffer.commit()
     }
     
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
@@ -131,21 +137,30 @@ class ViewController: NSViewController, MTKViewDelegate {
             return
         }
 
+        // Copy the contents of the previously-current texture to the texture we're about to read from
+        let blitCommandEncoder = commandBuffer.makeBlitCommandEncoder()!
+        blitCommandEncoder.copy(from: textures[inactiveTextureIndex],
+                                sourceSlice: 0,
+                                sourceLevel: 0,
+                                sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                                sourceSize: MTLSize(width: textures[inactiveTextureIndex].width,
+                                                    height: textures[inactiveTextureIndex].height,
+                                                    depth: 1),
+                                to: textures[currentTextureIndex],
+                                destinationSlice: 0,
+                                destinationLevel: 0,
+                                destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        blitCommandEncoder.endEncoding()
 
-        // MARK: - Kernel function
+        // MARK: - Compute Work Encoding
 
-        // I'm not even sure this is the right place to do this.
-        guard
-            let kernelFunction = library.makeFunction(name: "antsKernel"),
-            let computePipelineState = try? device.makeComputePipelineState(function: kernelFunction),
-            let computeEncoder = commandBuffer.makeComputeCommandEncoder()
-            else { return }
+        guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
         computeEncoder.setComputePipelineState(computePipelineState)
         // pass current time as seed for rng
         computeEncoder.setBytes(&time, length: MemoryLayout<Float>.stride, index: 0)
         // Set alternating in/out textures
-        computeEncoder.setTexture(textures[currentTextureIndex], index: 0)
-        computeEncoder.setTexture(textures[inactiveTextureIndex], index: 1)
+        computeEncoder.setTexture(textures[inactiveTextureIndex], index: 0)
+        computeEncoder.setTexture(textures[currentTextureIndex], index: 1)
 
         let threadsPerThreadGroup = MTLSizeMake(16, 16, 1)
 
@@ -154,8 +169,8 @@ class ViewController: NSViewController, MTKViewDelegate {
         // So as far as I understood it the below code makes it so that the kernel function only executes
         // on the top left quadrant of the texture (but modifies the entire texture)
         let threadGroups = MTLSizeMake(
-            textures[currentTextureIndex].width / 2 / threadsPerThreadGroup.width,
-            textures[currentTextureIndex].height / 2 / threadsPerThreadGroup.height,
+            textures[currentTextureIndex].width / 2,
+            textures[currentTextureIndex].height / 2,
             1)
         computeEncoder.dispatchThreads(threadGroups, threadsPerThreadgroup: threadsPerThreadGroup)
         computeEncoder.endEncoding()
@@ -172,12 +187,12 @@ class ViewController: NSViewController, MTKViewDelegate {
                                        height: Float(view.drawableSize.height)))
         
         // Corners of a screen-space quad (with +Y going down), suitable for
-        // drawing as a tri strip with CCW winding. Total data size = 32 bytes
+        // drawing as a tri strip with CCW winding. Total data size = 64 bytes
         var vertexData: [Float] = [
-            rect.minX, rect.minY, // top left
-            rect.minX, rect.maxY, // bottom left
-            rect.maxX, rect.minY, // top right
-            rect.maxX, rect.maxY  // bottom right
+            rect.minX, rect.minY, 0, 0, // top left
+            rect.minX, rect.maxY, 0, 1, // bottom left
+            rect.maxX, rect.minY, 1, 0, // top right
+            rect.maxX, rect.maxY, 1, 1, // bottom right
         ]
         
         var projectionMatrix = float4x4(orthoProjectionWidth: Float(view.drawableSize.width),
@@ -185,10 +200,7 @@ class ViewController: NSViewController, MTKViewDelegate {
                                         zNear: 0,
                                         zFar: 1.0)
 
-        // MARK: - Texture Scaling
-        // I removed the code for texture scaling since this texture should cover the entire screen it doesn't need to scale.
-        // Maybe?
-
+        // MARK: - Draw Call Encoding
 
         renderCommandEncoder.setVertexBytes(&vertexData, length: vertexData.count * MemoryLayout<Float>.size, index: 0)
         renderCommandEncoder.setVertexBytes(&projectionMatrix, length: MemoryLayout<float4x4>.size, index: 1)
@@ -202,8 +214,7 @@ class ViewController: NSViewController, MTKViewDelegate {
 
         // MARK: - Updating Current Texture
         // Switch out the current texture
-        currentTextureIndex = currentTextureIndex == 1 ? 0 : 1
-        inactiveTextureIndex = currentTextureIndex == 1 ? 0 : 1
+        swap(&currentTextureIndex, &inactiveTextureIndex)
 
         time += 1 / Float(view.preferredFramesPerSecond)
     }
